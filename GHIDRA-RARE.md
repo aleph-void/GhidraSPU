@@ -138,6 +138,12 @@ the table and writes a jump-table override, so the decompiler emits a `switch`.
 - **DENORM flag.** Never set: the model treats double-precision denormal operands as IEEE does.
   The ISA lets an implementation flush them to zero and set DENORM instead; which Cell
   processors do is not documented in the ISA and could not be checked without hardware.
+- **DWARF values wider than a word in registers.** Ghidra places a variable smaller than its
+  register at the register's low-order end, which for SPU registers is slot 3; scalars live in
+  slot 0. DWARF registers therefore map to the preferred words `rN_w0`, which is right for
+  every value of up to 4 bytes; an 8-byte or vector variable that DWARF places in a register
+  cannot be described with one mapping. (Function parameters come from the calling convention
+  and are unaffected.)
 - **PPU relocations** (`R_SPU_PPU32/64`) patch the PPU program that embeds the SPU image; they
   are reported, not applied.
 - **Decompiler output is wide.** Every SPU instruction is SIMD, so scalar code also computes the

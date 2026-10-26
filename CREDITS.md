@@ -57,7 +57,9 @@ Specs and loader:
 - ELF opinion fixed (`loader=` attribute; upstream's `load=` matched nothing).
 - `spu.cspec` rewritten for GCC's SPU ABI (preferred-slot arguments in r3-r74, r80-r127
   callee-saved, unsigned char, stack at sp+32).
-- `spu.dwarf` maps all 128 registers (upstream used an attribute Ghidra ignores).
+- `spu.dwarf` maps all 128 DWARF registers to their preferred-slot words (upstream used an
+  attribute Ghidra ignores, so only lr and sp were mapped) and declares the CFA
+  (`DW_OP_call_frame_cfa`, GCC's frame base) as sp at entry, so stack variables import.
 - ELF relocation handler ported to Ghidra 12's API; `R_SPU_ADD_PIC` applied only for undefined
   symbols, PPU relocations reported.
 - New analyzer "SPU Switch Tables" (`src/main/java/spu/analysis`): recovers GCC's jump tables
