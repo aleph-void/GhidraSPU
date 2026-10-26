@@ -218,6 +218,14 @@ def lanes(kind, fn):
     return '\n'.join(fn(k) for k in range(LANES[kind][1]))
 
 
+# The decompiler names a temporary through a hash of its neighbouring p-code ops and gives up
+# ("Unable to find unique hash for varnode") when more than 8 varnodes of one instruction hash
+# alike.  Operations with 16 identical byte-lane chains (or 12 identical conversions in fma)
+# therefore compute lanes 8-15 with an equivalent but differently shaped expression.
+def alt(k):
+    return k >= 8
+
+
 def zero_rest(f):
     return '\n'.join('%s = 0;' % f('w', k) for k in (1, 2, 3))
 
@@ -318,8 +326,14 @@ def operand_tables():
 # ---------------------------------------------------------------------------------------------
 # Single-precision extended-range helpers (per lane, code as a list of lines).
 
-def sp2d(x, n):
-    """SPU single (bits in x, 4 bytes) -> exact double n; exponent 0 reads as signed zero."""
+def sp2d(x, n, variant=False):
+    """SPU single (bits in x, 4 bytes) -> exact double n; exponent 0 reads as signed zero.
+    variant: the same value through differently shaped p-code (see alt())."""
+    if variant:
+        return ['local %se:4 = (%s << 1) >> 24;' % (n, x),
+                'local %sm:8 = (((zext(%se) + 896) << 52) + (zext(%s << 9) << 20)) & (0 - zext(%se != 0));'
+                % (n, n, x, n),
+                'local %s:8 = (zext(%s >> 31) << 63) + %sm;' % (n, x, n)]
     return ['local %se:4 = (%s >> 23) & 0xff;' % (n, x),
             'local %sm:8 = (((zext(%se) + 896) << 52) | (zext(%s & 0x7fffff) << 29)) * zext(%se != 0);'
             % (n, n, x, n),
@@ -378,7 +392,7 @@ def sp_arith(kind, dst, a, b, c=None):
         lines += sp2d(a('w', k), n + 'a'); ins[n + 'a'] = a('w', k)
         lines += sp2d(b('w', k), n + 'b'); ins[n + 'b'] = b('w', k)
         if c is not None:
-            lines += sp2d(c('w', k), n + 'c'); ins[n + 'c'] = c('w', k)
+            lines += sp2d(c('w', k), n + 'c', True); ins[n + 'c'] = c('w', k)
         if kind == 'mul':
             lines.append('local %sr:8 = %sa f* %sb;' % (n, n, n))
         elif kind == 'add':
@@ -404,6 +418,40 @@ def sp_arith(kind, dst, a, b, c=None):
         lines.append('%s = %so;' % (dst('w', k), n))
         lines.append(sp_flags(k, n + 'oov', n + 'ouf', n + 'df'))
     return '\n'.join(lines)
+
+
+# Double-precision helpers: classification and FPSCR exception flags.
+def dclass(x, n, size=8):
+    """Classify IEEE bits x (8 bytes double, 4 bytes single): n_nan, n_snan, n_inf."""
+    if size == 8:
+        sh, em, fm, qb = 52, 0x7ff, 0xfffffffffffff, 0x0008000000000000
+    else:
+        sh, em, fm, qb = 23, 0xff, 0x7fffff, 0x400000
+    return ['local %sx:%d = %s;' % (n, size, x),
+            'local %sme:1 = ((%sx >> %d) & %#x) == %#x;' % (n, n, sh, em, em),
+            'local %snan:1 = %sme && ((%sx & %#x) != 0);' % (n, n, n, fm),
+            'local %ssnan:1 = %snan && ((%sx & %#x) == 0);' % (n, n, n, qb),
+            'local %sinf:1 = %sme && ((%sx & %#x) == 0);' % (n, n, n, fm)]
+
+def dflags(k, ins, r, err, rsize=8, minnorm=0x0010000000000000):
+    """FPSCR flags of doubleword slot k for result bits r (rsize bytes) with the exact
+    rounding error err (any float size; 0 when exact) of inputs ins (classified names)."""
+    n = 'fl%d' % k
+    absmask = 0x7fffffffffffffff if rsize == 8 else 0x7fffffff
+    expmask = 0x7ff0000000000000 if rsize == 8 else 0x7f800000
+    L = dclass(r, n + 'r', rsize)
+    L += ['local %snanin:1 = %s;' % (n, ' || '.join('%snan' % i for i in ins)),
+          'local %ssnanin:1 = %s;' % (n, ' || '.join('%ssnan' % i for i in ins)),
+          'local %sinfin:1 = %s;' % (n, ' || '.join('%sinf' % i for i in ins)),
+          'local %sinv:1 = %ssnanin || (%srnan && !%snanin);' % (n, n, n, n),
+          'local %sovf:1 = %srinf && !%sinfin && !%snanin;' % (n, n, n, n),
+          'local %sinx:1 = %sovf || (!%srnan && !%srinf && (%s f!= 0));' % (n, n, n, n, err),
+          'local %sup:1 = ((%srx & %#x) == %#x) && ((%s f< 0) != ((%srx >> %d) != 0));'
+          % (n, n, absmask, minnorm, err, n, rsize * 8 - 1),
+          'local %sunf:1 = %sinx && (((%srx & %#x) == 0) || %sup);' % (n, n, n, expmask, n),
+          'FPSCR%d = FPSCR%d | (zext(%sovf) << 13) | (zext(%sunf) << 12) | (zext(%sinx) << 11) | '
+          '(zext(%sinv) << 10) | (zext(%snanin) << 9);' % (1 + k, 1 + k, n, n, n, n, n)]
+    return L
 
 
 # ---------------------------------------------------------------------------------------------
@@ -451,11 +499,14 @@ def instructions():
         ctrl(mn + 'x', size, None, mask, True)
 
     # ---- constant formation
-    ctor(':ilh', 'R0, u16', op('ilh'), lanes('h', lambda k: '%s = u16;' % T('h', k)))
-    ctor(':ilhu', 'R0, u16', op('ilhu'), lanes('w', lambda k: '%s = hv;' % T('w', k)), 'hv = u16 << 16;')
-    ctor(':il', 'R0, i16', op('il'), lanes('w', lambda k: '%s = i16;' % T('w', k)))
-    ctor(':ila', 'R0, u18', op('ila'), lanes('w', lambda k: '%s = u18;' % T('w', k)))
-    ctor(':iohl', 'R0, u16', op('iohl'), lanes('w', lambda k: '%s = %s | u16;' % (T('w', k), T('w', k))))
+    # replicated constants are written as two doublewords: fewer identical p-code ops than word
+    # lanes, and (unlike a 16-byte constant) the decompiler can fold them into the scalar slots
+    QREP = 'R0d0 = rep;\nR0d1 = rep;'
+    ctor(':ilh', 'R0, u16', op('ilh'), QREP, 'rep = u16 * 0x0001000100010001;')
+    ctor(':ilhu', 'R0, u16', op('ilhu'), QREP, 'rep = (u16 << 16) * 0x0000000100000001;')
+    ctor(':il', 'R0, i16', op('il'), QREP, 'rep = (i16 & 0xffffffff) * 0x0000000100000001;')
+    ctor(':ila', 'R0, u18', op('ila'), QREP, 'rep = u18 * 0x0000000100000001;')
+    ctor(':iohl', 'R0, u16', op('iohl'), 'R0d0 = R0d0 | rep;\nR0d1 = R0d1 | rep;', 'rep = u16 * 0x0000000100000001;')
     # (decode-time arithmetic is signed 64-bit, so build the masks with left shifts)
     hi = ' | '.join('(((u16 >> %d) & 1) * 0xff << %d)' % (15 - j, 56 - 8 * j) for j in range(8))
     lo = ' | '.join('(((u16 >> %d) & 1) * 0xff << %d)' % (7 - j, 56 - 8 * j) for j in range(8))
@@ -502,30 +553,38 @@ def instructions():
     ctor(':mpya', 'R21, R7, R14, R0', op('mpya'), lanes('w', lambda k: '%s = sext(%s) * sext(%s) + %s;' % (
         C('w', k), A('h', 2 * k + 1), B('h', 2 * k + 1), T('w', k))))
     ctor(':clz', 'R0, R7', op('clz'), lanes('w', lambda k: '%s = lzcount(%s);' % (T('w', k), A('w', k))))
-    ctor(':cntb', 'R0, R7', op('cntb'), lanes('b', lambda k: '%s = popcount(%s);' % (T('b', k), A('b', k))))
+    ctor(':cntb', 'R0, R7', op('cntb'), lanes('b', lambda k: ('%s = popcount(%s) & 0xf;' if alt(k) else
+                                                          '%s = popcount(%s);') % (T('b', k), A('b', k))))
     # form select mask
     ctor(':fsmb', 'R0, R7', op('fsmb'), 'local s:2 = R7h1;\n' + lanes(
-        'b', lambda k: 'local m%d:2 = 0 - ((s >> %d) & 1);\n%s = m%d:1;' % (k, 15 - k, T('b', k), k)))
+        'b', lambda k: ('local m%d:2 = ((s >> %d) & 1) * 0xff;\n%s = m%d:1;' if alt(k) else
+                        'local m%d:2 = 0 - ((s >> %d) & 1);\n%s = m%d:1;') % (k, 15 - k, T('b', k), k)))
     ctor(':fsmh', 'R0, R7', op('fsmh'), 'local s:1 = R7b3;\n' + lanes(
         'h', lambda k: '%s = 0 - zext((s >> %d) & 1);' % (T('h', k), 7 - k)))
     ctor(':fsm', 'R0, R7', op('fsm'), 'local s:4 = R7w0;\n' + lanes(
         'w', lambda k: '%s = 0 - ((s >> %d) & 1);' % (T('w', k), 3 - k)))
     # gather bits
     ctor(':gbb', 'R0, R7', op('gbb'), 'local s:4 = %s;\nR0w0 = s;\n%s' % (
-        ' | '.join('(zext(%s & 1) << %d)' % (A('b', j), 15 - j) for j in range(16)), zero_rest(T)))
+        ' | '.join(('((zext(%s) & 1) << %d)' if alt(j) else '(zext(%s & 1) << %d)') % (A('b', j), 15 - j)
+                   for j in range(16)), zero_rest(T)))
     ctor(':gbh', 'R0, R7', op('gbh'), 'local s:4 = %s;\nR0w0 = s;\n%s' % (
         ' | '.join('(zext(%s & 1) << %d)' % (A('h', j), 7 - j) for j in range(8)), zero_rest(T)))
     ctor(':gb', 'R0, R7', op('gb'), 'local s:4 = %s;\nR0w0 = s;\n%s' % (
         ' | '.join('((%s & 1) << %d)' % (A('w', j), 3 - j) for j in range(4)), zero_rest(T)))
     ctor(':avgb', 'R0, R7, R14', op('avgb'), lanes('b', lambda k: (
-        'local s%d:2 = (zext(%s) + zext(%s) + 1) >> 1;\n%s = s%d:1;' % (k, A('b', k), B('b', k), T('b', k), k))))
+        ('local s%d:2 = (zext(%s) + zext(%s) + 1) / 2;\n%s = s%d:1;' if alt(k) else
+         'local s%d:2 = (zext(%s) + zext(%s) + 1) >> 1;\n%s = s%d:1;') % (k, A('b', k), B('b', k), T('b', k), k))))
     ctor(':absdb', 'R0, R7, R14', op('absdb'), lanes('b', lambda k: (
-        'local x%d:1 = %s;\nlocal y%d:1 = %s;\n%s = ((x%d - y%d) * zext(y%d < x%d)) + ((y%d - x%d) * zext(x%d <= y%d));'
+        ('local x%d:1 = %s;\nlocal y%d:1 = %s;\n%s = ((x%d - y%d) * zext(x%d > y%d)) ^ ((y%d - x%d) * zext(y%d >= x%d));'
+         if alt(k) else
+         'local x%d:1 = %s;\nlocal y%d:1 = %s;\n%s = ((x%d - y%d) * zext(y%d < x%d)) + ((y%d - x%d) * zext(x%d <= y%d));')
         % (k, A('b', k), k, B('b', k), T('b', k), k, k, k, k, k, k, k, k))))
+    # byte sum of a word: add the byte pairs, then the two halfword sums
     ctor(':sumb', 'R0, R7, R14', op('sumb'), lanes('w', lambda k: (
-        'local sb%d:2 = %s;\nlocal sa%d:2 = %s;\n%s = (zext(sb%d) << 16) | zext(sa%d);'
-        % (k, ' + '.join('zext(%s)' % B('b', 4 * k + j) for j in range(4)), k,
-           ' + '.join('zext(%s)' % A('b', 4 * k + j) for j in range(4)), T('w', k), k, k))))
+        'local pb%d:4 = (%s & 0x00ff00ff) + ((%s >> 8) & 0x00ff00ff);\n'
+        'local pa%d:4 = (%s & 0x00ff00ff) + ((%s >> 8) & 0x00ff00ff);\n'
+        '%s = (((pb%d >> 16) + pb%d) << 16) | (((pa%d >> 16) + pa%d) & 0xffff);'
+        % (k, B('w', k), B('w', k), k, A('w', k), A('w', k), T('w', k), k, k, k, k))))
     ctor(':xsbh', 'R0, R7', op('xsbh'), lanes('h', lambda k: '%s = sext(%s);' % (T('h', k), A('b', 2 * k + 1))))
     ctor(':xshw', 'R0, R7', op('xshw'), lanes('w', lambda k: '%s = sext(%s);' % (T('w', k), A('h', 2 * k + 1))))
     ctor(':xswd', 'R0, R7', op('xswd'), lanes('d', lambda k: '%s = sext(%s);' % (T('d', k), A('w', 2 * k + 1))))
@@ -543,6 +602,18 @@ def instructions():
     ctor(':selb', 'R21, R7, R14, R0', op('selb'), 'R21 = (R0 & R14) | (~R0 & R7);')
     sh = ['local a:16 = R7;', 'local b:16 = R14;', 'local c:16 = R0;']
     for j in range(16):
+        if alt(j):
+            sh += ['local c%d:1 = c(%d);' % (j, 15 - j),
+                   'local x%d:1 = (c%d << 3) >> 3;' % (j, j),
+                   'local n%d:1 = (~x%d & 15) << 3;' % (j, j),
+                   'local ta%d:16 = a >> n%d;' % (j, j),
+                   'local tb%d:16 = b >> n%d;' % (j, j),
+                   'local sa%d:1 = ta%d:1;' % (j, j),
+                   'local sb%d:1 = tb%d:1;' % (j, j),
+                   'local v%d:1 = ((sa%d * zext((x%d & 0x10) == 0)) + (sb%d * zext((x%d & 0x10) != 0))) * zext((c%d & 0x80) == 0);'
+                   % (j, j, j, j, j, j),
+                   '%s = v%d + (0xff * zext((c%d >> 5) == 6)) + (0x80 * zext((c%d >> 5) == 7));' % (C('b', j), j, j, j)]
+            continue
         sh += ['local c%d:1 = c(%d);' % (j, 15 - j),
                'local x%d:1 = c%d & 0x1f;' % (j, j),
                'local n%d:1 = (15 - (x%d & 15)) * 8;' % (j, j),
@@ -620,6 +691,14 @@ def instructions():
     # ---- compares
     for base, opr in (('ceq', '=='), ('cgt', 's>'), ('clgt', '>')):
         for suf, kind in (('b', 'b'), ('h', 'h'), ('', 'w')):
+            if kind == 'b':
+                neg = {'==': '!=', 's>': 's<=', '>': '<='}[opr]
+                for mn, rhs, disp in ((base + suf, '%s', 'R0, R7, R14'), (base + suf + 'i', 'i10', 'R0, R7, i10')):
+                    ctor(':' + mn, disp, op(mn), lanes('b', lambda k: (
+                        '%s = zext(%s %s %s) - 1;' % (T('b', k), A('b', k), neg, rhs % B('b', k) if '%' in rhs else rhs)
+                        if alt(k) else
+                        '%s = 0 - zext(%s %s %s);' % (T('b', k), A('b', k), opr, rhs % B('b', k) if '%' in rhs else rhs))))
+                continue
             rr3(base + suf, kind, '{t} = 0 - zext({a} %s {b});' % opr)
             ri10(base + suf + 'i', kind, '{t} = 0 - zext({a} %s i10);' % opr)
 
@@ -768,23 +847,58 @@ def instructions():
             lines.append('%s = f%dv;' % (T('w', k), k))
         ctor(':' + mn, 'R0, R7, scale', op(mn), '\n'.join(lines),
              'scale = 173 - u8; scd = ((1023 + (173 - u8)) & 0x7ff) << 52;')
-    ctor(':fesd', 'R0, R7', op('fesd'), 'local s0:4 = R7w0;\nlocal s1:4 = R7w2;\nR0d0 = float2float(s0);\nR0d1 = float2float(s1);')
-    ctor(':frds', 'R0, R7', op('frds'), 'local d0:8 = R7d0;\nlocal d1:8 = R7d1;\nR0w0 = float2float(d0);\nR0w1 = 0;\nR0w2 = float2float(d1);\nR0w3 = 0;')
+    lines = []
+    for k in range(2):
+        n = 'e%d' % k
+        lines += dclass(A('w', 2 * k), n + 'a', 4)
+        lines += ['local %sd:8 = float2float(%sax);' % (n, n),
+                  'FPSCR%d = FPSCR%d | (zext(%sasnan) << 10) | (zext(%sanan) << 9);' % (1 + k, 1 + k, n, n)]
+    lines += ['R0d0 = e0d;', 'R0d1 = e1d;']
+    ctor(':fesd', 'R0, R7', op('fesd'), '\n'.join(lines))
+    lines = []
+    for k in range(2):
+        n = 'e%d' % k
+        lines += dclass(A('d', k), n + 'a')
+        lines += ['local %ss:4 = float2float(%sax);' % (n, n),
+                  'local %ser:8 = %sax f- float2float(%ss);' % (n, n, n)]
+        lines += dflags(k, [n + 'a'], n + 's', n + 'er', 4, 0x00800000)
+    lines += ['R0w0 = e0s;', 'R0w1 = 0;', 'R0w2 = e1s;', 'R0w3 = 0;']
+    ctor(':frds', 'R0, R7', op('frds'), '\n'.join(lines))
     ctor(':fscrrd', 'R0', op('fscrrd'), 'R0w0 = FPSCR0 & 0xf07;\nR0w1 = FPSCR1 & 0x3f07;\nR0w2 = FPSCR2 & 0x3f07;\nR0w3 = FPSCR3 & 0xf07;')
     ctor(':fscrwr', 'R0, R7', op('fscrwr'), 'FPSCR0 = R7w0 & 0xf07;\nFPSCR1 = R7w1 & 0x3f07;\nFPSCR2 = R7w2 & 0x3f07;\nFPSCR3 = R7w3 & 0xf07;')
 
-    # ---- double precision (IEEE, round to nearest)
-    for mn, e in (('dfa', '{a} f+ {b}'), ('dfs', '{a} f- {b}'), ('dfm', '{a} f* {b}')):
-        rr3(mn, 'd', '{t} = %s;' % e)
+    # ---- double precision (IEEE, round to nearest; FPSCR exception flags per slot)
+    for mn in ('dfa', 'dfs', 'dfm'):
+        lines = []
+        for k in range(2):
+            n = 'd%d' % k
+            a, b = A('d', k), B('d', k)
+            lines += dclass(a, n + 'a') + dclass(b, n + 'b')
+            if mn == 'dfm':
+                lines += ['local %sp:16 = float2float(%sax) f* float2float(%sbx);' % (n, n, n),
+                          'local %ss:8 = float2float(%sp);' % (n, n),
+                          'local %ser:16 = %sp f- float2float(%ss);' % (n, n, n)]
+            else:
+                y = n + 'bx' if mn == 'dfa' else n + 'nb'
+                if mn == 'dfs':
+                    lines.append('local %snb:8 = %sbx ^ 0x8000000000000000;' % (n, n))
+                lines += ['local %ss:8 = %sax f+ %s;' % (n, n, y),
+                          'local %sbb:8 = %ss f- %sax;' % (n, n, n),
+                          'local %ser:8 = (%sax f- (%ss f- %sbb)) f+ (%s f- %sbb);' % (n, n, n, n, y, n)]
+            lines += dflags(k, [n + 'a', n + 'b'], n + 's', n + 'er')
+        for k in range(2):
+            lines.append('%s = d%ds;' % (T('d', k), k))
+        ctor(':' + mn, 'R0, R7, R14', op(mn), '\n'.join(lines))
     # fused multiply-add: exact product in binary128, correctly rounded once to double
     for mn, sgnp, sgnt in (('dfma', '', ''), ('dfms', '', '-'), ('dfnms', '-', ''), ('dfnma', '-', '-')):
         lines = []
         for k in range(2):
             t, a, b = T('d', k), A('d', k), B('d', k)
             n = 'q%d' % k
-            lines += ['local %sa:16 = float2float(%s);' % (n, a),
-                      'local %sb:16 = float2float(%s);' % (n, b),
-                      'local %sc:16 = float2float(%s);' % (n, t),
+            lines += dclass(a, n + 'ia') + dclass(b, n + 'ib') + dclass(t, n + 'ic')
+            lines += ['local %sa:16 = float2float(%siax);' % (n, n),
+                      'local %sb:16 = float2float(%sibx);' % (n, n),
+                      'local %sc:16 = float2float(%sicx);' % (n, n),
                       'local %sp:16 = %sa f* %sb;' % (n, n, n)]
             if sgnp:
                 lines.append('%sp = f- %sp;' % (n, n))
@@ -799,7 +913,9 @@ def instructions():
                       'local %sup:1 = %smid && (%ser f!= 0) && ((%ser f< 0) == (%ss f< 0));' % (n, n, n, n, n),
                       'local %sdn:1 = %smid && (%ser f!= 0) && ((%ser f< 0) != (%ss f< 0));' % (n, n, n, n, n),
                       '%ss = %ss + zext(%sup) - zext(%sdn);' % (n, n, n, n),
-                      'local %sr:8 = float2float(%ss);' % (n, n)]
+                      'local %sr:8 = float2float(%ss);' % (n, n),
+                      'local %ste:16 = (%ss f- float2float(%sr)) f+ %ser;' % (n, n, n, n)]
+            lines += dflags(k, [n + 'ia', n + 'ib', n + 'ic'], n + 'r', n + 'te')
         for k in range(2):
             lines.append('%s = q%dr;' % (T('d', k), k))
         ctor(':' + mn, 'R0, R7, R14', op(mn), '\n'.join(lines))
