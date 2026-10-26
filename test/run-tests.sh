@@ -3,7 +3,7 @@
 #
 #   test/run-tests.sh [workdir]
 #
-# 1. regenerate spu.sinc/spu.cspec and check they match the committed files; compile the
+# 1. regenerate spu.sinc/spu.cspec/spu.dwarf and check they match the committed files; compile the
 #    SLEIGH spec; link the module into $GHIDRA_INSTALL_DIR/Ghidra/Processors/SPU and build
 #    lib/SPU.jar (relocation handler)
 # 2. if ISA_TXT is set (tools/fetch-isa.sh output): check the opcode table against the SPU ISA
@@ -28,6 +28,7 @@ fail=0
 echo "== generators and SLEIGH"
 python3 "$MOD/tools/gen_spu_sinc.py" | cmp - "$MOD/data/languages/spu.sinc" && echo "   spu.sinc is up to date"
 python3 "$MOD/tools/gen_spu_cspec.py" | cmp - "$MOD/data/languages/spu.cspec" && echo "   spu.cspec is up to date"
+python3 "$MOD/tools/gen_spu_cspec.py" --dwarf | cmp - "$MOD/data/languages/spu.dwarf" && echo "   spu.dwarf is up to date"
 "$GHIDRA_INSTALL_DIR/support/sleigh" "$MOD/data/languages/spu.slaspec" 2>&1 | grep -E "^ERROR|^Error" && fail=1
 ls -l "$MOD/data/languages/spu.sla" | awk '{print "   " $5, $9}'
 P="$GHIDRA_INSTALL_DIR/Ghidra/Processors/SPU"
